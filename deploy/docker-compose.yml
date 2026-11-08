@@ -1,0 +1,27 @@
+services:
+  scripthost:
+    build: ..
+    container_name: scripthost
+    restart: unless-stopped
+    # Host networking lets scripts reach LAN devices (mDNS, broadcasts, MQTT, ...) and lets services
+    # bind ports your reverse proxy can forward to. Use a bridge network + "ports:" if you prefer isolation.
+    network_mode: host
+    volumes:
+      - ./data:/data
+    environment:
+      SCRIPTHOST_PORT: "8080"
+      SCRIPTHOST_PUBLIC_URL: "https://scripthost.home.lan/mcp"
+      TZ: "Europe/Berlin"
+
+      SCRIPTHOST_AUTH_MODE: "oidc"
+      SCRIPTHOST_OIDC_ISSUER: "https://auth.home.lan"
+      SCRIPTHOST_OIDC_REQUIRED_SCOPES: "openid profile groups"
+      SCRIPTHOST_OIDC_REQUIRED_GROUPS: "scripthost-admins"
+      SCRIPTHOST_OIDC_ALLOWED_CLIENTS: "claude-code"
+      # Only needed if Authelia issues opaque access tokens (see README):
+      SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_ID: "scripthost"
+      SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_SECRET: "${SCRIPTHOST_INTROSPECTION_SECRET:?set in .env}"
+
+      # Quick start without Authelia instead:
+      # SCRIPTHOST_AUTH_MODE: "token"
+      # SCRIPTHOST_STATIC_TOKEN: "${SCRIPTHOST_TOKEN:?set in .env}"
