@@ -21,6 +21,8 @@ from starlette.responses import JSONResponse
 from .auth import OIDCTokenVerifier, StaticTokenMiddleware
 from .config import Config
 from .engine import Engine
+from .secrets import NAME_RE as SECRET_NAME_RE
+from .secrets import Secrets
 from .store import Project, Store, StoreError, resolve_inside, validate_policy
 
 log = logging.getLogger("scripthost")
@@ -42,7 +44,9 @@ Runtime conventions for scripts:
 - cwd is a persistent per-project working directory (also in $SCRIPTHOST_WORK_DIR); store state,
   caches and output files there. Source lives read-only in $SCRIPTHOST_SRC_DIR (on PYTHONPATH).
 - Log to stdout/stderr (it is captured per run). Exit non-zero on failure.
-- Put credentials in `secret_env` (never in source files); they are exposed as env vars.
+- Never put credentials in source files or `env`. The operator defines secrets out of band; call
+  list_secrets to see their names and attach them via `secrets=[...]`. Each one is exposed as an env
+  var of the same name. Secret values are masked as ***NAME*** in logs and file contents you read.
 - Services that serve HTTP should read the port from an env var such as PORT.
 """
 
@@ -54,7 +58,8 @@ FilesArg = Annotated[
 
 def build(config: Config) -> tuple[MCPServer, Store, Engine]:
     store = Store(config.data_dir)
-    engine = Engine(store, config)
+    secret_store = Secrets(config.secrets_file or config.data_dir / "secrets.env")
+    engine = Engine(store, config, secret_store)
 
     kwargs: dict[str, Any] = {}
     if config.auth_mode == "oidc":
@@ -78,7 +83,7 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
             "restart_policy": p.restart_policy,
             "cron": p.cron,
             "service": engine.service_status(p.name)["state"],
-            "updated_at": p.public_dict()["updated_at"],
+            "updated_at": public(p)["updated_at"],
         }
 
     def status(p: Project) -> dict[str, Any]:
@@ -90,6 +95,24 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
             "active_runs": [{"run_id": r.run_id, "trigger": r.trigger, "pid": r.proc.pid} for r in engine.active_runs(p.name)],
             "recent_runs": store.runs(p.name, 5),
         }
+
+    def check_secrets(names: list[str]) -> list[str]:
+        names = list(dict.fromkeys(names))
+        bad = [n for n in names if not SECRET_NAME_RE.match(n)]
+        if bad:
+            raise StoreError(f"invalid secret name(s): {', '.join(bad)}")
+        missing = [n for n in names if n not in secret_store.names()]
+        if missing:
+            raise StoreError(
+                f"secret(s) {', '.join(missing)} are not defined. Available: {', '.join(secret_store.names()) or 'none'}. "
+                "Ask the operator to add missing ones to the secrets file."
+            )
+        return names
+
+    def public(p: Project) -> dict[str, Any]:
+        d = p.public_dict()
+        d["env"] = {k: secret_store.mask(v) for k, v in d["env"].items()}
+        return d
 
     def merge_env(current: dict[str, str], changes: dict[str, str | None] | None) -> dict[str, str]:
         out = dict(current)
@@ -131,7 +154,7 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
                 if chunk < size:
                     all_lines = all_lines[1:]  # first line is probably partial
                 selected, truncated = all_lines[-lines:], chunk < size or len(all_lines) > lines
-        text = "\n".join(selected)
+        text = secret_store.mask("\n".join(selected))
         if len(text) > config.max_read_bytes:
             text, truncated = "…" + text[-config.max_read_bytes:], True
         return text, truncated
@@ -191,18 +214,30 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
             size = f.stat().st_size
             if include_source and size <= budget:
                 try:
-                    files[rel] = f.read_text(encoding="utf-8")
+                    files[rel] = secret_store.mask(f.read_text(encoding="utf-8"))
                     budget -= size
                     continue
                 except UnicodeDecodeError:
                     pass
             files[rel] = f"<{size} bytes; use read_file(area='src') to read>"
-        return {"project": p.public_dict(), "shown_revision": rev, "files": files, "status": status(p)}
+        return {"project": public(p), "shown_revision": rev, "files": files, "status": status(p)}
 
     @mcp.tool(annotations=read_only)
     def list_revisions(name: str) -> dict[str, Any]:
         """List the source revisions of a project (newest first) with their change messages."""
         return {"revisions": store.revisions(name)}
+
+    @mcp.tool(annotations=read_only)
+    def list_secrets() -> dict[str, Any]:
+        """List the names of secrets the operator has defined (values are never shown) and which projects use them."""
+        used: dict[str, list[str]] = {}
+        for p in store.all():
+            for n in p.secrets:
+                used.setdefault(n, []).append(p.name)
+        return {
+            "secrets": [{"name": n, "used_by": used.pop(n, [])} for n in secret_store.names()],
+            "missing_but_referenced": [{"name": n, "used_by": ps} for n, ps in sorted(used.items())],
+        }
 
     # ------------------------------------------------------------------ authoring
     @mcp.tool()
@@ -214,7 +249,7 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
         requirements: Annotated[list[str] | None, Field(description="pip requirements, e.g. ['requests>=2', 'paho-mqtt']")] = None,
         args: Annotated[list[str] | None, Field(description="Default command-line arguments")] = None,
         env: Annotated[dict[str, str] | None, Field(description="Non-secret environment variables")] = None,
-        secret_env: Annotated[dict[str, str] | None, Field(description="Secret env vars (tokens, passwords); never shown again")] = None,
+        secrets: Annotated[list[str] | None, Field(description="Names of operator-defined secrets to expose as env vars (see list_secrets)")] = None,
         restart_policy: Literal["no", "on-failure", "always"] = "no",
         cron: Annotated[str | None, Field(description="5-field cron schedule, e.g. '*/10 * * * *'")] = None,
         cron_timeout: Annotated[int | None, Field(description="Kill cron runs after this many seconds")] = None,
@@ -226,7 +261,7 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
             engine.validate_cron(cron)
         p = Project(
             name=name, description=description.strip(), entrypoint=entrypoint, args=args or [],
-            env=merge_env({}, env), secret_env=merge_env({}, secret_env), restart_policy=restart_policy,
+            env=merge_env({}, env), secrets=check_secrets(secrets or []), restart_policy=restart_policy,
             cron=cron or None, cron_timeout=cron_timeout,
         )
         if not p.description:
@@ -237,7 +272,7 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
         if start_service and "FAILED" not in report["dependencies"]:
             await engine.start_service(name)
         p = store.get(name)
-        return {"created": p.public_dict()} | report | {"status": status(p)}
+        return {"created": public(p)} | report | {"status": status(p)}
 
     @mcp.tool()
     async def update_project(
@@ -250,7 +285,7 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
         entrypoint: str | None = None,
         args: list[str] | None = None,
         env: Annotated[dict[str, str | None] | None, Field(description="Merged into env; null value deletes a key")] = None,
-        secret_env: Annotated[dict[str, str | None] | None, Field(description="Merged into secret env; null deletes")] = None,
+        secrets: Annotated[list[str] | None, Field(description="Replaces the list of attached secret names")] = None,
         restart_policy: Literal["no", "on-failure", "always"] | None = None,
         cron: Annotated[str | None, Field(description="New cron schedule; empty string removes it")] = None,
         cron_timeout: int | None = None,
@@ -270,7 +305,8 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
         if args is not None:
             p.args = args
         p.env = merge_env(p.env, env)
-        p.secret_env = merge_env(p.secret_env, secret_env)
+        if secrets is not None:
+            p.secrets = check_secrets(secrets)
         if restart_policy is not None:
             validate_policy(restart_policy)
             p.restart_policy = restart_policy
@@ -296,12 +332,12 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
         report = await install_report(p)
         engine.reschedule(p)
         restarted = False
-        runtime_changed = code_changed or env or secret_env or args is not None or entrypoint is not None
+        runtime_changed = code_changed or env or secrets is not None or args is not None or entrypoint is not None
         if restart_if_running and runtime_changed and engine.service_status(name)["state"] in ("running", "backoff"):
             if "FAILED" not in report["dependencies"]:
                 await engine.restart_service(name)
                 restarted = True
-        return {"project": p.public_dict(), "service_restarted": restarted} | report
+        return {"project": public(p), "service_restarted": restarted} | report
 
     @mcp.tool()
     async def rollback_project(name: str, revision: int, message: str | None = None) -> dict[str, Any]:
@@ -461,7 +497,7 @@ def build(config: Config) -> tuple[MCPServer, Store, Engine]:
         result: dict[str, Any] = {"path": path, "size": size, "offset": offset, "returned_bytes": len(data),
                                   "truncated": offset + len(data) < size}
         try:
-            result["content"] = data.decode("utf-8")
+            result["content"] = secret_store.mask(data.decode("utf-8"))
             result["encoding"] = "utf-8"
         except UnicodeDecodeError:
             result["content"] = base64.b64encode(data).decode()

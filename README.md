@@ -20,12 +20,12 @@ deploys it as a cron job or a supervised service.
 | **Cron** | 5-field cron expressions, optional per-run timeout, overlapping runs are skipped |
 | **Logs** | stdout+stderr captured per run, `get_logs` with tail + regex filter, retention per project |
 | **Files** | persistent working dir per project: `list_files`, `read_file` (text or base64), `write_work_file` |
-| **Secrets** | `secret_env` values are injected as env vars and never returned to the LLM |
+| **Secrets** | defined by you in a `.env` file; the LLM only sees names, attaches them to projects, and gets values masked in logs/files |
 | **Auth** | OIDC resource server (built for **Authelia**), static bearer token, or none |
 
 ### Tools
 
-`search_projects`, `list_projects`, `get_project`, `list_revisions`, `create_project`,
+`search_projects`, `list_projects`, `get_project`, `list_revisions`, `list_secrets`, `create_project`,
 `update_project`, `rollback_project`, `delete_project`, `run_once`, `start_service`,
 `stop_service`, `restart_service`, `stop_run`, `get_status`, `list_runs`, `get_logs`,
 `list_files`, `read_file`, `write_work_file`, `delete_work_file`
@@ -34,7 +34,8 @@ deploys it as a cron job or a supervised service.
 
 - cwd = persistent working dir (`$SCRIPTHOST_WORK_DIR`); source is in `$SCRIPTHOST_SRC_DIR` (on `PYTHONPATH`)
 - `entrypoint` is a file (`main.py`) or a module name (run with `python -m`)
-- env = project `env` + `secret_env` + per-run overrides, plus `SCRIPTHOST_PROJECT`, `SCRIPTHOST_REVISION`
+- env = project `env` + per-run overrides + attached secrets, plus `SCRIPTHOST_PROJECT`, `SCRIPTHOST_REVISION`.
+  Scripts do **not** inherit the server's own environment.
 - each run is its own process group; stop = SIGTERM, then SIGKILL after 10 s
 
 ## Running
@@ -43,12 +44,37 @@ deploys it as a cron job or a supervised service.
 cd deploy
 echo "SCRIPTHOST_INTROSPECTION_SECRET=..." > .env
 mkdir -p data && sudo chown 1000:1000 data   # container runs as uid 1000
+cp secrets.env.example data/secrets.env && chmod 600 data/secrets.env   # then fill in
 docker compose up -d --build
 ```
 
 Or without Docker: `pip install . && SCRIPTHOST_DATA_DIR=./data scripthost-mcp`.
 
 Data lives in `/data` (`scripthost.db` + `projects/<name>/{rev,work,venv,logs}`).
+
+### Secrets
+
+Put them in `/data/secrets.env` (path configurable via `SCRIPTHOST_SECRETS_FILE`), dotenv syntax:
+
+```dotenv
+# Home Assistant long-lived token
+HA_TOKEN=eyJhbGciOi...
+export MQTT_PASSWORD='p@ss word'
+```
+
+- The file is re-read whenever it changes. New values apply to the **next run**; restart a
+  service to pick them up.
+- The LLM calls `list_secrets` (names + which projects use them) and attaches them with
+  `create_project(..., secrets=["HA_TOKEN"])`. Each one becomes an env var of the same name. Only
+  attached secrets are injected, and a run's `env` overrides cannot shadow them.
+- Every value of 4+ characters is replaced with `***NAME***` in everything the tools return: logs,
+  `run_once` output, `read_file` text, source shown by `get_project`.
+- A run fails with a clear error if an attached secret is missing from the file.
+
+Masking only prevents *accidental* exposure. The LLM writes the code, so it could still encode a
+value (base64, reversed, split across lines) and read it back. Scripts also run as the same user as
+the server, so they could read `secrets.env` directly. Separating these needs the per-project
+sandbox from the roadmap.
 
 ### Configuration (environment variables)
 
@@ -65,6 +91,7 @@ Data lives in `/data` (`scripthost.db` + `projects/<name>/{rev,work,venv,logs}`)
 | `SCRIPTHOST_OIDC_ALLOWED_CLIENTS` | | only accept tokens issued to these client ids |
 | `SCRIPTHOST_OIDC_AUDIENCE` | | if set, token `aud` must contain it |
 | `SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_ID` / `_SECRET` | | needed for opaque (non-JWT) access tokens |
+| `SCRIPTHOST_SECRETS_FILE` | `<data_dir>/secrets.env` | operator-defined secrets (see above) |
 | `SCRIPTHOST_LOG_RETENTION_RUNS` | `50` | finished runs (and their logs) kept per project |
 | `SCRIPTHOST_DEFAULT_TEST_TIMEOUT` | `120` | default `run_once` timeout in seconds |
 
@@ -142,8 +169,8 @@ root-ish shell access to that box:
   inside the container, not as root on the host.
 - `network_mode: host` gives scripts full LAN access, which is the point for smart-home use, but
   also means a bad script can reach everything the host can.
-- Secrets in `secret_env` are hidden from tool output but readable by the project's own scripts.
-  Any project can read them through its environment.
+- Secret values never pass through the LLM, but any script can read `secrets.env` and the
+  database, since it runs as the server's user (see *Secrets*).
 
 ## Development
 

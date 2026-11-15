@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS projects (
     entrypoint TEXT NOT NULL,
     args TEXT NOT NULL DEFAULT '[]',
     env TEXT NOT NULL DEFAULT '{}',
-    secret_env TEXT NOT NULL DEFAULT '{}',
+    secrets TEXT NOT NULL DEFAULT '[]',
     restart_policy TEXT NOT NULL DEFAULT 'no',
     cron TEXT,
     cron_timeout INTEGER,
@@ -77,7 +77,7 @@ class Project:
     entrypoint: str
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
-    secret_env: dict[str, str] = field(default_factory=dict)
+    secrets: list[str] = field(default_factory=list)  # names of operator-provided secrets
     restart_policy: str = "no"
     cron: str | None = None
     cron_timeout: int | None = None
@@ -94,7 +94,7 @@ class Project:
             entrypoint=row["entrypoint"],
             args=json.loads(row["args"]),
             env=json.loads(row["env"]),
-            secret_env=json.loads(row["secret_env"]),
+            secrets=json.loads(row["secrets"]),
             restart_policy=row["restart_policy"],
             cron=row["cron"],
             cron_timeout=row["cron_timeout"],
@@ -105,14 +105,14 @@ class Project:
         )
 
     def public_dict(self) -> dict[str, Any]:
-        """Representation safe to hand to the LLM (secret values hidden)."""
+        """Representation handed to the LLM (secrets by name only)."""
         return {
             "name": self.name,
             "description": self.description,
             "entrypoint": self.entrypoint,
             "args": self.args,
             "env": self.env,
-            "secret_env_keys": sorted(self.secret_env),
+            "secrets": self.secrets,
             "restart_policy": self.restart_policy,
             "cron": self.cron,
             "cron_timeout": self.cron_timeout,
@@ -158,6 +158,9 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        columns = {r["name"] for r in self._db.execute("PRAGMA table_info(projects)")}
+        if "secrets" not in columns:  # databases created by v0.1
+            self._db.execute("ALTER TABLE projects ADD COLUMN secrets TEXT NOT NULL DEFAULT '[]'")
 
     # ---------------------------------------------------------------- paths
     def project_dir(self, name: str) -> Path:
@@ -267,20 +270,20 @@ class Store:
 
     def _save(self, p: Project, insert: bool) -> None:
         values = (
-            p.description, p.entrypoint, json.dumps(p.args), json.dumps(p.env), json.dumps(p.secret_env),
+            p.description, p.entrypoint, json.dumps(p.args), json.dumps(p.env), json.dumps(p.secrets),
             p.restart_policy, p.cron, p.cron_timeout, int(p.service_enabled), p.revision,
             p.created_at, p.updated_at, p.name,
         )
         if insert:
             self._x(
-                "INSERT INTO projects(description, entrypoint, args, env, secret_env, restart_policy, cron,"
+                "INSERT INTO projects(description, entrypoint, args, env, secrets, restart_policy, cron,"
                 " cron_timeout, service_enabled, revision, created_at, updated_at, name)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 values,
             )
         else:
             self._x(
-                "UPDATE projects SET description=?, entrypoint=?, args=?, env=?, secret_env=?, restart_policy=?,"
+                "UPDATE projects SET description=?, entrypoint=?, args=?, env=?, secrets=?, restart_policy=?,"
                 " cron=?, cron_timeout=?, service_enabled=?, revision=?, created_at=?, updated_at=? WHERE name=?",
                 values,
             )

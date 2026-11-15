@@ -43,6 +43,9 @@ class Config:
     # Extra Host header values accepted (DNS-rebinding protection); empty = derived from public_url
     allowed_hosts: list[str] = field(default_factory=list)
 
+    # dotenv file with operator-provided secrets; default <data_dir>/secrets.env
+    secrets_file: Path | None = None
+
     log_retention_runs: int = 50
     default_test_timeout: int = 120
     max_read_bytes: int = 200_000
@@ -64,6 +67,7 @@ class Config:
             oidc_required_scopes=_list("OIDC_REQUIRED_SCOPES"),
             oidc_allowed_clients=_list("OIDC_ALLOWED_CLIENTS"),
             allowed_hosts=_list("ALLOWED_HOSTS"),
+            secrets_file=Path(_env("SECRETS_FILE")) if _env("SECRETS_FILE") else None,
             log_retention_runs=int(_env("LOG_RETENTION_RUNS", "50")),
             default_test_timeout=int(_env("DEFAULT_TEST_TIMEOUT", "120")),
             max_read_bytes=int(_env("MAX_READ_BYTES", "200000")),

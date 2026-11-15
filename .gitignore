@@ -6,3 +6,4 @@ deploy/data/
 deploy/.env
 *.egg-info/
 dist/
+secrets.env

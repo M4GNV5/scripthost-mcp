@@ -18,6 +18,7 @@ from typing import Any
 from croniter import croniter
 
 from .config import Config
+from .secrets import Secrets
 from .store import Project, Store, StoreError
 
 log = logging.getLogger("scripthost.engine")
@@ -51,9 +52,10 @@ class ServiceState:
 
 
 class Engine:
-    def __init__(self, store: Store, config: Config):
+    def __init__(self, store: Store, config: Config, secrets: Secrets):
         self.store = store
         self.config = config
+        self.secrets = secrets
         self.active: dict[int, ActiveRun] = {}
         self.services: dict[str, ServiceState] = {}
         self._venv_locks: dict[str, asyncio.Lock] = {}
@@ -150,10 +152,19 @@ class Engine:
             "SCRIPTHOST_WORK_DIR": str(workdir),
         }
         env.update(project.env)
-        env.update(project.secret_env)
         if extra:
             env.update(extra)
+        env.update(self._secret_values(project))  # secrets win, so a run can't shadow them
         return {k: v for k, v in env.items() if v is not None}
+
+    def _secret_values(self, project: Project) -> dict[str, str]:
+        try:
+            return self.secrets.resolve(project.secrets)
+        except KeyError as exc:
+            raise StoreError(
+                f"secret(s) {exc.args[0]} not defined in {self.secrets.path}; "
+                "ask the operator to add them or remove them from the project"
+            ) from None
 
     async def launch(
         self,
@@ -165,6 +176,7 @@ class Engine:
         timeout: float | None = None,
     ) -> ActiveRun:
         project = self.store.get(name)
+        self._secret_values(project)
         venv = await self.ensure_venv(project)
         run_id = self.store.run_start(name, project.revision, trigger)
         log_path = self.store.run_log(name, run_id)

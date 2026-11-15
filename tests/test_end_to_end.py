@@ -51,11 +51,9 @@ async def test_create_run_update_logs_files(tmp_path):
 
       upd = data(await client.call_tool("update_project", {
           "name": "hello", "files": {"main.py": "import sys\nprint('v2'); sys.exit(3)\n"}, "message": "v2",
-          "env": {"FOO": "bar"}, "secret_env": {"TOKEN": "s3cret"},
+          "env": {"FOO": "bar"},
       }))
       assert upd["project"]["revision"] == 2
-      assert upd["project"]["secret_env_keys"] == ["TOKEN"]
-      assert "s3cret" not in json.dumps(upd)
 
       run = data(await client.call_tool("run_once", {"name": "hello"}))
       assert run["status"] == "failed" and run["exit_code"] == 3 and "v2" in run["output"]
@@ -69,15 +67,14 @@ async def test_create_run_update_logs_files(tmp_path):
       assert "v2" in logs["log"]
 
 
-async def test_requirements_and_secret_env(tmp_path):
+async def test_requirements(tmp_path):
   async with host(tmp_path) as env:
       client, *_ = env
       res = data(await client.call_tool("create_project", {
           "name": "deps",
           "description": "uses a dependency",
-          "files": {"main.py": "import os, six\nprint(six.__name__, os.environ['TOKEN'])\n"},
+          "files": {"main.py": "import six\nprint(six.__name__, 'abc')\n"},
           "requirements": ["six"],
-          "secret_env": {"TOKEN": "abc"},
       }))
       assert res["dependencies"] == "installed", res
       run = data(await client.call_tool("run_once", {"name": "deps"}))
@@ -153,3 +150,60 @@ async def test_path_safety_and_errors(tmp_path):
       assert bad.is_error
       gone = await client.call_tool("delete_project", {"name": "p", "confirm": True})
       assert not gone.is_error
+
+
+async def test_secrets_from_dotenv(tmp_path):
+    (tmp_path / "secrets.env").write_text(
+        "# smart home\nHA_TOKEN=eyJhbGciOiJIUzI1NiJ9.secretvalue\nexport MQTT_PASSWORD='p@ss word'\nSHORT=ab\n"
+    )
+    async with host(tmp_path) as (client, store, engine):
+        listed = data(await client.call_tool("list_secrets", {}))
+        assert [s["name"] for s in listed["secrets"]] == ["HA_TOKEN", "MQTT_PASSWORD", "SHORT"]
+        assert "secretvalue" not in json.dumps(listed)
+
+        bad = await client.call_tool("create_project", {
+            "name": "x", "description": "d", "files": {"main.py": "pass"}, "secrets": ["NOPE"]})
+        assert bad.is_error and "HA_TOKEN" in bad.content[0].text  # lists what is available
+
+        script = (
+            "import os, pathlib\n"
+            "print('token', os.environ['HA_TOKEN'])\n"
+            "print('pw', os.environ['MQTT_PASSWORD'])\n"
+            "print('unattached', os.environ.get('SHORT'))\n"
+            "pathlib.Path('out.txt').write_text(os.environ['HA_TOKEN'])\n"
+        )
+        res = data(await client.call_tool("create_project", {
+            "name": "ha", "description": "talks to home assistant", "files": {"main.py": script},
+            "secrets": ["HA_TOKEN", "MQTT_PASSWORD"],
+        }))
+        assert res["created"]["secrets"] == ["HA_TOKEN", "MQTT_PASSWORD"]
+
+        run = data(await client.call_tool("run_once", {"name": "ha", "env": {"HA_TOKEN": "override"}}))
+        assert run["status"] == "succeeded", run
+        out = run["output"]
+        assert "token ***HA_TOKEN***" in out and "pw ***MQTT_PASSWORD***" in out
+        assert "secretvalue" not in out and "p@ss word" not in out
+        assert "unattached None" in out  # only attached secrets are injected; run env can't shadow them
+
+        # the real value really is in the process env / on disk, just masked on the way out
+        assert (store.work_dir("ha") / "out.txt").read_text() == "eyJhbGciOiJIUzI1NiJ9.secretvalue"
+        f = data(await client.call_tool("read_file", {"name": "ha", "path": "out.txt"}))
+        assert f["content"] == "***HA_TOKEN***"
+        logs = data(await client.call_tool("get_logs", {"name": "ha"}))
+        assert "secretvalue" not in logs["log"]
+
+        # file is re-read on change; removing a secret makes runs fail with a clear error
+        (tmp_path / "secrets.env").write_text("MQTT_PASSWORD=x1234\n")
+        import os, time as _t
+        os.utime(tmp_path / "secrets.env", (_t.time() + 5, _t.time() + 5))
+        bad = await client.call_tool("run_once", {"name": "ha"})
+        assert bad.is_error and "HA_TOKEN" in bad.content[0].text
+        listed = data(await client.call_tool("list_secrets", {}))
+        assert listed["missing_but_referenced"] == [{"name": "HA_TOKEN", "used_by": ["ha"]}]
+
+
+def test_parse_dotenv():
+    from scripthost.secrets import parse_dotenv
+    assert parse_dotenv(
+        "A=1\n# c\n\nexport B = two words # comment\nC=\"quoted # not a comment\"\nD='x=y'\nbad line\n"
+    ) == {"A": "1", "B": "two words", "C": "quoted # not a comment", "D": "x=y"}
