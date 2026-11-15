@@ -18,9 +18,9 @@ services:
       SCRIPTHOST_OIDC_REQUIRED_SCOPES: "openid profile groups"
       SCRIPTHOST_OIDC_REQUIRED_GROUPS: "scripthost-admins"
       SCRIPTHOST_OIDC_ALLOWED_CLIENTS: "claude-code"
-      # Only needed if Authelia issues opaque access tokens (see README):
-      SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_ID: "scripthost"
-      SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_SECRET: "${SCRIPTHOST_INTROSPECTION_SECRET:?set in .env}"
+      # Only needed if the claude-code client issues opaque tokens instead of JWTs (see README):
+      # SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_ID: "scripthost"
+      # SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_SECRET: "${SCRIPTHOST_INTROSPECTION_SECRET:?set in .env}"
 
       # Quick start without Authelia instead:
       # SCRIPTHOST_AUTH_MODE: "token"

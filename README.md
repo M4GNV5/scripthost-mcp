@@ -42,7 +42,6 @@ deploys it as a cron job or a supervised service.
 
 ```bash
 cd deploy
-echo "SCRIPTHOST_INTROSPECTION_SECRET=..." > .env
 mkdir -p data && sudo chown 1000:1000 data   # container runs as uid 1000
 cp secrets.env.example data/secrets.env && chmod 600 data/secrets.env   # then fill in
 docker compose up -d --build
@@ -124,19 +123,27 @@ identity_providers:
         grant_types: ['authorization_code', 'refresh_token']
         response_types: ['code']
         token_endpoint_auth_method: 'none'
-        # Option A: JWT access tokens, verified locally (no introspection client needed),
-        # if your Authelia version supports it:
-        # access_token_signed_response_alg: 'RS256'
+        # JWT access tokens, verified locally against Authelia's JWKS (Authelia's default is
+        # opaque tokens, which would need a separate introspection client)
+        access_token_signed_response_alg: 'RS256'
+        userinfo_signed_response_alg: 'none'
+```
 
-      # Option B (default opaque tokens): confidential client scripthost uses for introspection
+<details><summary>Alternative: opaque tokens + introspection client</summary>
+
+Leave out `access_token_signed_response_alg` and add a confidential client for scripthost. Then set
+`SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_ID` and `SCRIPTHOST_OIDC_INTROSPECTION_CLIENT_SECRET`:
+
+```yaml
       - client_id: 'scripthost'
         client_name: 'scripthost introspection'
         client_secret: '$pbkdf2-sha512$310000$...'   # authelia crypto hash generate pbkdf2 --random
         public: false
-        authorization_policy: 'two_factor'
+        authorization_policy: 'one_factor'
         grant_types: ['client_credentials']
         token_endpoint_auth_method: 'client_secret_basic'
 ```
+</details>
 
 Create a group such as `scripthost-admins` for the users who may use it, and set
 `SCRIPTHOST_OIDC_REQUIRED_GROUPS` to it.
